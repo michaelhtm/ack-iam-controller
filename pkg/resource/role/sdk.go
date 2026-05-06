@@ -326,7 +326,7 @@ func (rm *resourceManager) sdkCreate(
 	}
 	return &resource{ko}, ackrequeue.Needed(fmt.Errorf("role created, requeuing to trigger updates"))
 
-	return &resource{ko}, nil
+	return &resource{ko}, ackrequeue.NeededAfter(nil, 0)
 }
 
 // newCreateRequestPayload returns an SDK-specific struct for the HTTP request
@@ -391,18 +391,6 @@ func (rm *resourceManager) sdkUpdate(
 	defer func() {
 		exit(err)
 	}()
-	if delta.DifferentAt("Spec.Policies") {
-		err = rm.syncManagedPolicies(ctx, desired, latest)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if delta.DifferentAt("Spec.InlinePolicies") {
-		err = rm.syncInlinePolicies(ctx, desired, latest)
-		if err != nil {
-			return nil, err
-		}
-	}
 	if delta.DifferentAt("Spec.Tags") {
 		err = rm.syncTags(ctx, desired, latest)
 		if err != nil {
@@ -415,19 +403,55 @@ func (rm *resourceManager) sdkUpdate(
 			return nil, err
 		}
 	}
-	if delta.DifferentAt("Spec.AssumeRolePolicyDocument") {
-		err = rm.putAssumeRolePolicy(ctx, desired)
+
+	ko := desired.ko.DeepCopy()
+	rm.setStatusDefaults(ko)
+
+	var requeueNeeded bool
+
+	if delta.DifferentAt("Spec.Description") || delta.DifferentAt("Spec.MaxSessionDuration") {
+		ko, err = rm.sdkUpdateUpdateRole(ctx, desired, ko)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if !delta.DifferentExcept("Spec.Tags", "Spec.Policies", "Spec.InlinePolicies", "Spec.PermissionsBoundary", "Spec.AssumeRolePolicyDocument") {
-		return desired, nil
+
+	if delta.DifferentAt("Spec.AssumeRolePolicyDocument") {
+		ko, err = rm.sdkUpdateUpdateAssumeRolePolicy(ctx, desired, ko)
+		if err != nil {
+			return nil, err
+		}
+		requeueNeeded = true
 	}
 
-	input, err := rm.newUpdateRequestPayload(ctx, desired, delta)
+	if delta.DifferentAt("Spec.Policies") {
+		err = rm.syncAttachRolePolicy(ctx, desired, latest)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if delta.DifferentAt("Spec.InlinePolicies") {
+		err = rm.syncPutRolePolicy(ctx, desired, latest)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if requeueNeeded {
+		return &resource{ko}, ackrequeue.NeededAfter(nil, 0)
+	}
+	return &resource{ko}, nil
+}
+
+func (rm *resourceManager) sdkUpdateUpdateRole(
+	ctx context.Context,
+	desired *resource,
+	ko *svcapitypes.Role,
+) (*svcapitypes.Role, error) {
+	input, err := rm.newUpdateRolePayload(desired)
 	if err != nil {
-		return nil, err
+		return ko, err
 	}
 
 	var resp *svcsdk.UpdateRoleOutput
@@ -435,22 +459,14 @@ func (rm *resourceManager) sdkUpdate(
 	resp, err = rm.sdkapi.UpdateRole(ctx, input)
 	rm.metrics.RecordAPICall("UPDATE", "UpdateRole", err)
 	if err != nil {
-		return nil, err
+		return ko, err
 	}
-	// Merge in the information we read from the API call above to the copy of
-	// the original Kubernetes object we passed to the function
-	ko := desired.ko.DeepCopy()
 
-	rm.setStatusDefaults(ko)
-	return &resource{ko}, nil
+	return ko, nil
 }
 
-// newUpdateRequestPayload returns an SDK-specific struct for the HTTP request
-// payload of the Update API call for the resource
-func (rm *resourceManager) newUpdateRequestPayload(
-	ctx context.Context,
+func (rm *resourceManager) newUpdateRolePayload(
 	r *resource,
-	delta *ackcompare.Delta,
 ) (*svcsdk.UpdateRoleInput, error) {
 	res := &svcsdk.UpdateRoleInput{}
 
@@ -472,6 +488,131 @@ func (rm *resourceManager) newUpdateRequestPayload(
 	return res, nil
 }
 
+func (rm *resourceManager) sdkUpdateUpdateAssumeRolePolicy(
+	ctx context.Context,
+	desired *resource,
+	ko *svcapitypes.Role,
+) (*svcapitypes.Role, error) {
+	input, err := rm.newUpdateAssumeRolePolicyPayload(desired)
+	if err != nil {
+		return ko, err
+	}
+
+	var resp *svcsdk.UpdateAssumeRolePolicyOutput
+	_ = resp
+	resp, err = rm.sdkapi.UpdateAssumeRolePolicy(ctx, input)
+	rm.metrics.RecordAPICall("UPDATE", "UpdateAssumeRolePolicy", err)
+	if err != nil {
+		return ko, err
+	}
+
+	return ko, nil
+}
+
+func (rm *resourceManager) newUpdateAssumeRolePolicyPayload(
+	r *resource,
+) (*svcsdk.UpdateAssumeRolePolicyInput, error) {
+	res := &svcsdk.UpdateAssumeRolePolicyInput{}
+
+	if r.ko.Spec.AssumeRolePolicyDocument != nil {
+		res.PolicyDocument = r.ko.Spec.AssumeRolePolicyDocument
+	}
+	if r.ko.Spec.Name != nil {
+		res.RoleName = r.ko.Spec.Name
+	}
+
+	return res, nil
+}
+
+// syncAttachRolePolicy examines the desired and latest values of the
+// Policies field and calls the AttachRolePolicy and
+// DetachRolePolicy APIs to bring the observed state in line with desired.
+func (rm *resourceManager) syncAttachRolePolicy(
+	ctx context.Context,
+	desired *resource,
+	latest *resource,
+) (err error) {
+	rlog := ackrtlog.FromContext(ctx)
+	exit := rlog.Trace("rm.syncAttachRolePolicy")
+	defer func() { exit(err) }()
+
+	toAdd, toRemove := ackcompare.SliceStringPDifference(
+		desired.ko.Spec.Policies,
+		latest.ko.Spec.Policies,
+	)
+
+	for _, item := range toAdd {
+		rlog.Debug("adding item via AttachRolePolicy", "item", *item)
+		input := &svcsdk.AttachRolePolicyInput{}
+		input.PolicyArn = item
+		input.RoleName = desired.ko.Spec.Name
+
+		_, err = rm.sdkapi.AttachRolePolicy(ctx, input)
+		rm.metrics.RecordAPICall("UPDATE", "AttachRolePolicy", err)
+		if err != nil {
+			return err
+		}
+	}
+	for _, item := range toRemove {
+		rlog.Debug("removing item via DetachRolePolicy", "item", *item)
+		input := &svcsdk.DetachRolePolicyInput{}
+		input.PolicyArn = item
+		input.RoleName = desired.ko.Spec.Name
+
+		_, err = rm.sdkapi.DetachRolePolicy(ctx, input)
+		rm.metrics.RecordAPICall("UPDATE", "DetachRolePolicy", err)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// syncPutRolePolicy examines the desired and latest values of the
+// InlinePolicies field and calls the PutRolePolicy and
+// DeleteRolePolicy APIs to bring the observed state in line with desired.
+func (rm *resourceManager) syncPutRolePolicy(
+	ctx context.Context,
+	desired *resource,
+	latest *resource,
+) (err error) {
+	rlog := ackrtlog.FromContext(ctx)
+	exit := rlog.Trace("rm.syncPutRolePolicy")
+	defer func() { exit(err) }()
+
+	toAddOrUpdate, toRemove := ackcompare.MapStringStringPDifference(
+		desired.ko.Spec.InlinePolicies,
+		latest.ko.Spec.InlinePolicies,
+	)
+
+	for key, val := range toAddOrUpdate {
+		rlog.Debug("adding/updating item via PutRolePolicy", "key", key)
+		input := &svcsdk.PutRolePolicyInput{}
+		input.PolicyDocument = &key
+		input.PolicyName = val
+		input.RoleName = desired.ko.Spec.Name
+
+		_, err = rm.sdkapi.PutRolePolicy(ctx, input)
+		rm.metrics.RecordAPICall("UPDATE", "PutRolePolicy", err)
+		if err != nil {
+			return err
+		}
+	}
+	for _, key := range toRemove {
+		rlog.Debug("removing item via DeleteRolePolicy", "key", key)
+		input := &svcsdk.DeleteRolePolicyInput{}
+		input.PolicyName = &key
+		input.RoleName = desired.ko.Spec.Name
+
+		_, err = rm.sdkapi.DeleteRolePolicy(ctx, input)
+		rm.metrics.RecordAPICall("UPDATE", "DeleteRolePolicy", err)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // sdkDelete deletes the supplied resource in the backend AWS service API
 func (rm *resourceManager) sdkDelete(
 	ctx context.Context,
@@ -485,11 +626,11 @@ func (rm *resourceManager) sdkDelete(
 	// This deletes all associated managed and inline policies from the role
 	roleCpy := r.ko.DeepCopy()
 	roleCpy.Spec.Policies = nil
-	if err := rm.syncManagedPolicies(ctx, &resource{ko: roleCpy}, r); err != nil {
+	if err := rm.syncAttachRolePolicy(ctx, &resource{ko: roleCpy}, r); err != nil {
 		return nil, err
 	}
 	roleCpy.Spec.InlinePolicies = map[string]*string{}
-	if err := rm.syncInlinePolicies(ctx, &resource{ko: roleCpy}, r); err != nil {
+	if err := rm.syncPutRolePolicy(ctx, &resource{ko: roleCpy}, r); err != nil {
 		return nil, err
 	}
 

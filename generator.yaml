@@ -211,6 +211,32 @@ resources:
         DeleteRole:
           input_fields:
             RoleName: Name
+        UpdateAssumeRolePolicy:
+          input_fields:
+            RoleName: Name
+            PolicyDocument: AssumeRolePolicyDocument
+        AttachRolePolicy:
+          input_fields:
+            RoleName: Name
+        DetachRolePolicy:
+          input_fields:
+            RoleName: Name
+        PutRolePolicy:
+          input_fields:
+            RoleName: Name
+        DeleteRolePolicy:
+          input_fields:
+            RoleName: Name
+    update_operations:
+      - operation_id: UpdateRole
+      - operation_id: UpdateAssumeRolePolicy
+        requeue_on_success: true
+      - operation_id: AttachRolePolicy
+        fields:
+          - Policies
+      - operation_id: PutRolePolicy
+        fields:
+          - InlinePolicies
     fields:
       MaxSessionDuration:
         late_initialize: {}

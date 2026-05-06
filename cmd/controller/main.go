@@ -177,7 +177,7 @@ func main() {
 		}
 	}
 
-	if err = sc.BindControllerManager(mgr, ackCfg); err != nil {
+	if err = sc.BindControllerManager(ctx, mgr, ackCfg); err != nil {
 		setupLog.Error(
 			err, "unable bind to controller manager to service controller",
 			"aws.service", awsServiceAlias,
